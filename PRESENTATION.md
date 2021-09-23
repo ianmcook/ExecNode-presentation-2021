@@ -1,0 +1,81 @@
+class: center, middle
+
+# ExecNodes
+
+---
+
+# Agenda
+
+- Motivation
+- Introduction to the `class`es
+- Building and running an ExecPlan
+- FAQ
+- Eventually...
+
+---
+
+# Motivation
+
+We need a way to specify a graph of 
+
+---
+
+# Agenda
+
+1. Motivation
+  - streaming execution (compare to CallFunction)
+  - composability of operations (contrast to dataset)
+2. The classes
+  - ExecNode (maps onto a blazing kernel)
+    - receives batches (unless it's a source) then does something then
+      emits batches (unless it's a sink)
+      - for example a FilterNode receives batches, drops some
+        rows, then passes it along
+      - for example an AggregateNode receives batches, updates
+        sums, then emits results when the input completes
+    - note that it's a graph node: you can look at the inputs
+      and outputs vector to walk upstream or downstream in the
+      graph
+    - lifecycle methods:
+      - need explicit start from outside the graph
+      - can be stopped from outside the graph (for example, if the
+      - can be stopped by an output (which doesn't need more batches)
+      - error reporting != stopping
+    - note that each ExecNode has a single output schema
+  - ExecPlan
+    - keeps the ExecNodes alive
+    - provides convenience methods like "start all nodes" and
+      "are all nodes done"
+  - ExecFactoryRegistry
+    - None of the concrete implementations of this interface are exposed
+      in a header, so they can't be constructed directly outside the TU
+      where they are defined. Instead, factories to create them are added
+      to a registry.
+      - Decouple, optimization
+      - Easier composition of extensions, like "scan" nodes.
+    - Declaration, MakeExecNode (discussed later)
+  - 
+3. How to build an ExecPlan
+  - MakeExecNode
+  - 
+4. Gotchas
+  - Not repeatably usable (constrast datasets, tables. Maps to
+    RecordBatchReader, and in fact we can produce a source node
+    which wraps a reader and we can extract a reader from a sink node)
+  - Ordering, please
+    - deterministic, as-on-disk ordering for simple scans
+    - order dependent aggregates/window functions
+  - How do these relate to Kernels?
+5. Eventually...
+  - Taskify
+  - Backpressure
+  - fan out execution of expressions
+  - Maybe allow ordering along some edges of the graph
+  - Maybe multiple outputs
+  - No more explicit construction. *Everybody* should produce IR
+    and have that mapped onto ExecNodes
+
+---
+
+# Introduction
+
