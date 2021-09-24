@@ -9,7 +9,7 @@ class: center, middle
 - Motivation
 - Introduction to the `class`es
 - Building and running an ExecPlan
-- FAQ
+- FAQs
 - Eventually...
 
 ---
@@ -242,6 +242,7 @@ while the graph is running, instances of ExecNode:
 
 1. receive batches from inputs and process them
   - unless it's a source
+  - might be stateful or stateless, responsible for its own sync
 2. emit batches to outputs
   - unless it's a sink
 
@@ -265,6 +266,38 @@ maps onto a Blazing kernel
       - error reporting != stopping; errors pass through the graph
         alongside batches instead of breaking everything.
     - note that each ExecNode has a single output schema
+
+---
+
+```
+// a basic ExecNode which ignores all input batches
+class ExampleNode : public cp::ExecNode {
+ public:
+  ExampleNode(ExecNode* input, const ExampleNodeOptions&)
+      : ExecNode(/*plan=*/input->plan(), /*inputs=*/{input},
+                 /*input_labels=*/{"ignored"},
+                 /*output_schema=*/input->output_schema(), /*num_outputs=*/1) {}
+
+  const char* kind_name() const override { return "ExampleNode"; }
+
+  arrow::Status StartProducing() override {
+    outputs_[0]->InputFinished(this, 0);
+    return arrow::Status::OK();
+  }
+
+  void ResumeProducing(ExecNode* output) override {}
+  void PauseProducing(ExecNode* output) override {}
+
+  void StopProducing(ExecNode* output) override { inputs_[0]->StopProducing(this); }
+  void StopProducing() override { inputs_[0]->StopProducing(); }
+
+  void InputReceived(ExecNode* input, cp::ExecBatch batch) override {}
+  void ErrorReceived(ExecNode* input, arrow::Status error) override {}
+  void InputFinished(ExecNode* input, int total_batches) override {}
+
+  arrow::Future<> finished() override { return inputs_[0]->finished(); }
+};
+```
 
 ---
 
@@ -340,7 +373,7 @@ in headers, so they can't be constructed directly outside the
 Translation Unit where they are defined.
 Instead, factories to create them are added to a registry.
 
-#### Don't use factories directly; we have helper functions:
+#### .note[Don't use factories directly; we have helper functions:]
 
 ```
 ExecNode* filter_node = *MakeExecNode("filter",
@@ -389,6 +422,12 @@ ExecNode* sink_node = *MakeExecNode("sink", /*...*/);
 
 .footnote[FromReader is in [PR#11032](https://github.com/apache/arrow/pull/11032) at the moment, I've included it here for brevity]
 
+???
+
+Note: a source node can be made from anything which resembles a stream
+of batches. That PR is wrapping a stream of data from DuckDB as a source
+node! Give us a stream, we can plug it into an ExecPlan.
+
 ---
 
 # How to build an ExecPlan
@@ -422,6 +461,12 @@ ExecNode* sink_node = *MakeExecNode("sink",
 
 .footnote[IntoReader is not in any PR yet]
 
+???
+
+Note: a sink node produces a stream of batches, so it can
+be consumed by anything which can utilize a stream of batches.
+Anything which can consume a stream can plug into an ExecPlan.
+
 ---
 
 # How to build an ExecPlan
@@ -437,7 +482,7 @@ ASSERT_OK(Declaration::Sequence(
               {
                   {"source", SourceNodeOptions::FromReader(
                        reader,
-                       GetCpuThreadPool()))},
+                       GetCpuThreadPool())},
                   {"filter", FilterNodeOptions{
                        greater(field_ref("score"), literal(3))}},
                   {"project", ProjectNodeOptions{
@@ -448,131 +493,171 @@ ASSERT_OK(Declaration::Sequence(
               .AddToPlan(plan.get()));
 ```
 
----
-
-# Agenda
-
-4. Gotchas
-  - Not repeatably usable (constrast datasets, tables. Maps to
-    RecordBatchReader, and in fact we can produce a source node
-    which wraps a reader and we can extract a reader from a sink node)
-  - Ordering, please
-    - deterministic, as-on-disk ordering for simple scans
-    - order dependent aggregates/window functions
-  - How do these relate to Kernels?
-5. Eventually...
-  - Taskify
-  - Backpressure
-  - fan out execution of expressions
-  - Maybe allow ordering along some edges of the graph
-  - Maybe multiple outputs
-  - No more explicit construction. *Everybody* should produce IR
-    and have that mapped onto ExecNodes
+(These are used in the c++ unit tests and in the implementation of `Scanner`)
 
 ---
 
 # How to build an ExecPlan
 
+- What about nodes with multiple inputs?
+
 ```
-TEST(ScanNode, MinimalGroupedAggEndToEnd) {
-  // NB: This test is here for didactic purposes
+Declaration left{"source", SourceNodeOptions::FromReader(
+   customer_reader,
+   GetCpuThreadPool())};
 
-* // Specify a MemoryPool and ThreadPool for the ExecPlan
-  compute::ExecContext exec_context(default_memory_pool(), GetCpuThreadPool());
+Declaration right = Declaration::Sequence({
+        {"source", SourceNodeOptions::FromReader(
+             customer_reader, GetCpuThreadPool())}
+        {"filter", FilterNodeOptions{
+             not_like(field_ref("o_comment"), R"(\w+\b\w+)")}}});
 
-  // ensure arrow::dataset node factories are in the registry
-  arrow::dataset::internal::Initialize();
+ASSERT_OK(Declaration::Sequence(
+              {
+*                 {"hashjoin", {left, right}, HashJoinNodeOptions{
+                      /* join kind, join fields, ... */}},
 
-  // A ScanNode is constructed from an ExecPlan (into which it is inserted),
-  // a Dataset (whose batches will be scanned), and ScanOptions (to specify a filter for
-  // predicate pushdown, a projection to skip materialization of unnecessary columns, ...)
-  ASSERT_OK_AND_ASSIGN(std::shared_ptr<compute::ExecPlan> plan,
-                       compute::ExecPlan::Make(&exec_context));
-
-  std::shared_ptr<Dataset> dataset = std::make_shared<InMemoryDataset>(
-      TableFromJSON(schema({field("a", int32()), field("b", boolean())}),
-                    {
-                        R"([{"a": 1,    "b": null},
-                            {"a": 2,    "b": true}])",
-                        R"([{"a": null, "b": true},
-                            {"a": 3,    "b": false}])",
-                        R"([{"a": null, "b": true},
-                            {"a": 4,    "b": false}])",
-                        R"([{"a": 5,    "b": null},
-                            {"a": 6,    "b": false},
-                            {"a": 7,    "b": false}])",
-                    }));
-
-  auto options = std::make_shared<ScanOptions>();
-  // sync scanning is not supported by ScanNode
-  options->use_async = true;
-  // specify the filter
-  compute::Expression b_is_true = field_ref("b");
-  options->filter = b_is_true;
-  // for now, specify the projection as the full project expression (eventually this can
-  // just be a list of materialized field names)
-  compute::Expression a_times_2 = call("multiply", {field_ref("a"), literal(2)});
-  compute::Expression b = field_ref("b");
-  options->projection =
-      call("make_struct", {a_times_2, b}, compute::MakeStructOptions{{"a * 2", "b"}});
-
-  // construct the scan node
-  ASSERT_OK_AND_ASSIGN(
-      compute::ExecNode * scan,
-      compute::MakeExecNode("scan", plan.get(), {}, ScanNodeOptions{dataset, options}));
-
-  // pipe the scan node into a project node
-  ASSERT_OK_AND_ASSIGN(
-      compute::ExecNode * project,
-      compute::MakeExecNode("project", plan.get(), {scan},
-                            compute::ProjectNodeOptions{{a_times_2, b}, {"a * 2", "b"}}));
-
-  // pipe the projection into a grouped aggregate node
-  ASSERT_OK_AND_ASSIGN(
-      compute::ExecNode * aggregate,
-      compute::MakeExecNode("aggregate", plan.get(), {project},
-                            compute::AggregateNodeOptions{
-                                {compute::internal::Aggregate{"hash_sum", nullptr}},
-                                /*targets=*/{"a * 2"},
-                                /*names=*/{"sum(a * 2)"},
-                                /*keys=*/{"b"}}));
-
-  // finally, pipe the aggregate node into a sink node
-  AsyncGenerator<util::optional<compute::ExecBatch>> sink_gen;
-  ASSERT_OK_AND_ASSIGN(compute::ExecNode * sink,
-                       compute::MakeExecNode("sink", plan.get(), {aggregate},
-                                             compute::SinkNodeOptions{&sink_gen}));
-
-  ASSERT_THAT(plan->sinks(), ElementsAre(sink));
-
-  // translate sink_gen (async) to sink_reader (sync)
-  std::shared_ptr<RecordBatchReader> sink_reader = compute::MakeGeneratorReader(
-      schema({field("sum(a * 2)", int64()), field("b", boolean())}), std::move(sink_gen),
-      exec_context.memory_pool());
-
-  // start the ExecPlan
-  ASSERT_OK(plan->StartProducing());
-
-  // collect sink_reader into a Table
-  ASSERT_OK_AND_ASSIGN(auto collected, Table::FromRecordBatchReader(sink_reader.get()));
-
-  // Sort table
-  ASSERT_OK_AND_ASSIGN(
-      auto indices, compute::SortIndices(
-                        collected, compute::SortOptions({compute::SortKey(
-                                       "sum(a * 2)", compute::SortOrder::Ascending)})));
-  ASSERT_OK_AND_ASSIGN(auto sorted, compute::Take(collected, indices));
-
-  // wait 1s for completion
-  ASSERT_TRUE(plan->finished().Wait(/*seconds=*/1)) << "ExecPlan didn't finish within 1s";
-
-  auto expected = TableFromJSON(
-      schema({field("sum(a * 2)", int64()), field("b", boolean())}), {
-                                                                         R"JSON([
-                                               {"sum(a * 2)": 4,  "b": true},
-                                               {"sum(a * 2)": 12, "b": null},
-                                               {"sum(a * 2)": 40, "b": false}
-                                          ])JSON"});
-  AssertTablesEqual(*expected, *sorted.table(), /*same_chunk_layout=*/false);
-}
+                  {"aggregate", AggregateNodeOptions{
+                      /*aggregations=*/{{"hash_count"}},
+                      /*targets=*/{"o_orderkey"},
+                      /*names=*/{"c_count"},
+                      /*keys=*/{"c_custkey"},
+                      },
+                  //...
+              })
+              .AddToPlan(plan.get()));
 ```
+
+???
+
+The hash join node is in a PR
+https://github.com/apache/arrow/pull/11150
+
+---
+
+# How to build an ExecPlan
+
+- What about datasets?
+
+Datasets can be used to produce scan nodes, which act like a source.
+(It might be useful to think of a scan node as shorthand for constructing
+a `Scanner` which scans your dataset, getting a `Reader` from the dataset,
+then wrapping that `Reader` into a source node).
+
+```
+arrow::dataset::internal::Initialize();
+
+std::shared_ptr<Dataset> dataset = GetDataset();
+
+ASSERT_OK(Declaration::Sequence(
+              {
+                  {"scan", ScanNodeOptions{
+*                    dataset,
+                     /* push down predicate, projection, ... */},
+                  {"filter", FilterNodeOptions{/* ... */}},
+                  // ...
+              })
+              .AddToPlan(plan.get()));
+```
+
+Datasets may be scanned multiple times, which in this context means one can
+produce multiple scan nodes from a single dataset. (Useful
+for a self-join, for example.)
+
+???
+
+By contrast: RecordBatchReader is not reusable!
+
+---
+
+# FAQs
+
+- How does this relate to an `arrow::compute::Kernel`?
+
+.note[Confusion warning:
+BlazingSQL had (has?) a class named Kernel, but it was most analagous
+to ExecNode.]
+
+`arrow::compute::Kernel`s represent a different unit of reusable computation.
+- avoid/defer allocation if possible
+- not internally thread safe
+- minimal functionality
+- targeted for processing single batches
+
+In short, `arrow::compute::Kernel`s are mostly *.note[used by]*
+ExecNode implementations. For example, `FilterNode` uses potentially
+many kernels to evaluate filter conditions and others to materialize
+batches with some rows excluded by that filter condition.
+
+???
+
+  (favorite example: one of the addition kernels adds two buffers of
+   `int32_t` into a consumer-preallocated buffer of `int32_t`)
+
+---
+
+# FAQs
+
+- Can I make a Dataset which wraps a RecordBatchReader?
+
+No.
+
+Datasets are *re*scannable, RecordBatchReaders are single-use.
+
+Make a scan node instead!
+
+???
+
+Related: can I make a Dataset which wraps an ExecPlan (also no).
+Keep in mind that an ExecPlan maps more-or-less onto a
+RecordBatchReader/stream of results- it's not reusable.
+
+---
+
+# FAQs
+
+- What about multiple outputs?
+
+We don't currently have any ExecNodes like that.
+There's active debate over whether we want to.
+
+.note[out of scope]
+---
+
+# FAQs
+
+- How are batches ordered?
+
+Inside an ExecPlan, they are not ordered.
+
+Dataset scans can cheat this slightly by tagging batches
+with file-of-origin info.
+
+`OrderBySinkNode` is the ExecNode which corresponds to
+SQL's `ORDER BY`. It sorts the batches *as they leave the graph*.
+
+We may need to change this; some aggregates and window functions
+require ordering of their input.
+
+> [Active debate currently being led by Weston Pace.](https://docs.google.com/document/d/1MfVE9td9D4n5y-PTn66kk4-9xG7feXs1zSFf-qxQgPs/edit#)
+???
+
+Tagging breaks down some when we split batches for fan out
+
+Our interface for reusability is the stream of batches,
+which is unordered.
+
+---
+
+# Eventually...
+
+  - Taskify
+  - Backpressure
+  - Graceful spill-to-disk/out-of-core execution
+  - fan out execution of expressions ala HyPer
+  - Maybe allow ordering along some edges of the graph
+  - Maybe multiple outputs
+  - No more explicit construction. *Everybody* should produce IR
+    and have that mapped onto ExecNodes.
+  - GPU backed ExecNodes
+
