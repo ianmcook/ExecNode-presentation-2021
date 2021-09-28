@@ -12,6 +12,8 @@ class: center, middle
 - FAQs
 - Eventually...
 
+.note[Content warning: lotsa C++]
+
 ---
 
 # Motivation
@@ -22,7 +24,6 @@ We need a way to specify arbitrarily complex computations
 
 One very common way to structure this is by defining a data
 flow graph: data flows along edges and is processed at nodes.
-
 
 ---
 
@@ -72,7 +73,7 @@ flow graph: data flows along edges and is processed at nodes.
 <!-- join&#45;&gt;join again -->
 <g id="edge3" class="edge">
 <title>join&#45;&gt;join again</title>
-<path fill="none" stroke="#000000" d="M195.1578,-217.3008C200.8051,-208.6496 207.8305,-197.8873 214.1788,-188.1623"/>
+<path fill="none" stroke="#000000" d="M195.1578,-217.3008C200.8051,-208.6496 207.8305,-197.rename8873 214.1788,-188.1623"/>
 <polygon fill="#000000" stroke="#000000" points="217.224,-189.9002 219.7594,-179.6132 211.3623,-186.0738 217.224,-189.9002"/>
 </g>
 <!-- filter again -->
@@ -150,9 +151,45 @@ flow graph: data flows along edges and is processed at nodes.
 </g>
 </svg>
 
-
-
 ???
+
+What's a stream mean?
+In our case, it means that a node has some data and pushes
+batches of that that data into a receiving node (push model).
+
+Streaming is critical because we can throttle
+how much data is in memory at a time- so we can tune batch
+size for performance at a single node independent of any
+other nodes.
+
+The flow of data makes a very convenient interface for
+compartmentalization, too:
+- Nodes with differing functionality don't need to be
+  tied together in any way with nodes at other places in
+  the graph.
+- Streams are well defined across machine boundaries,
+  so we can distribute the graph as well (for example
+  have basic scan/filter/project close to source data
+  while then having those stream to a join node on another
+  box)
+- Streams are also well defined across backend boundaries-
+  a GPU backed node can totally stream to a CPU backed node
+  and vice versa.
+
+You may have encountered pull-model streams before, which are
+the opposite: each node requests data as needed from its
+upstream nodes.
+
+Each of these has strengths and weaknesses, but
+We use push model because newer data base systems have reported
+better cache coherence than using pull model.
+https://arxiv.org/pdf/1610.09166.pdf
+
+SHAIKHHA, A., DASHTI, M., & KOCH, C. (2018). Push versus pull-based loop fusion in query engines. Journal of Functional Programming, 28. https://doi.org/10.1017/s0956796818000102
+
+- filter: comment does *not* indicate a special category of product
+- join: on customer id so that we're looking at an order and the user who made it
+- count distinct customers
 
 ```
 digraph G {
@@ -181,6 +218,8 @@ digraph G {
 
 quick overview:
 
+#### src/arrow/compute/exec/exec_plan.h
+
 ```
 // each node in the graph is an implementation of ExecNode
 class ExecNode;
@@ -191,6 +230,13 @@ class ExecPlan;
 // nodes are constructed by factories in an ExecFactoryRegistry
 class ExecFactoryRegistry;
 
+// dplyr-inspired helper for efficiently constructing ExecPlans
+struct Declaration;
+```
+
+#### src/arrow/compute/exec/options.h
+
+```
 // nodes are parameterized by ExecNodeOptions
 class ExecNodeOptions;
 ```
@@ -203,6 +249,7 @@ class ExecNodeOptions;
 class ExecNode;
 class ExecPlan;
 class ExecFactoryRegistry;
+struct Declaration;
 class ExecNodeOptions;
 ```
 
@@ -220,7 +267,7 @@ namespace arrow::compute {
 // - abstract base class (interface)
 // - very public, exposed in all bindings
 // - may eventually lazily materialize its columns for dataframiness
-namespace compute {
+namespace arrow {
   class RecordBatch;
 }
 ```
@@ -229,6 +276,9 @@ These are interconvertible to each other (and to/from `cudf::table`).
 
 ???
 
+Both of these are single chunk- if you've got a column of 1k float32s
+then that will be stored in a single contiguous buffer of 4kBytes.
+
 - arrow::compute::ExecBatch is intended to be an extremely lightweight chunk of data, cheaply transmissible along edges of a compute graph. They support columns which are Scalars (a single literal value) in addition to Arrays, and carry execution-relevant sidecar properties like a guaranteed-true-filter for Expression simplification and a SelectionVector indicating delayed filtration.
 - arrow::RecordBatch is an abstract base class. Although there is currently only one implementation (SimpleRecordBatch) there may eventually be fancier ones, such as one which lazily materializes its columns. It is much less cheap. arrow::Tables are also abstract base classes with the same motivation and unlike batches their columns are not required to be a single chunk of array.
 
@@ -236,14 +286,13 @@ These are interconvertible to each other (and to/from `cudf::table`).
 
 # The `class`es - `ExecNode`
 
-`src/arrow/compute/exec/exec_plan.h`
+while the graph is running, each instance of ExecNode:
 
-while the graph is running, instances of ExecNode:
-
-1. receive batches from inputs and process them
+1. has batches pushed to it from inputs and processes them
   - unless it's a source
-  - might be stateful or stateless, responsible for its own sync
-2. emit batches to outputs
+  - might be stateful or stateless
+  - responsible for its own sync
+2. pushes batches to outputs
   - unless it's a sink
 
 ???
@@ -256,48 +305,220 @@ maps onto a Blazing kernel
         rows, then passes it along
       - for example an AggregateNode receives batches, updates
         sums, then emits results when the input completes
-    - note that it's a graph node: you can look at the inputs
-      and outputs vector to walk upstream or downstream in the
-      graph
-    - lifecycle methods:
-      - need explicit start from outside the graph
-      - can be stopped from outside the graph (for example, if the
-      - can be stopped by an output (which doesn't need more batches)
-      - error reporting != stopping; errors pass through the graph
-        alongside batches instead of breaking everything.
-    - note that each ExecNode has a single output schema
 
 ---
 
 ```
-// a basic ExecNode which ignores all input batches
-class ExampleNode : public cp::ExecNode {
+// a basic ExecNode which passes all input batches through unchanged
+class PassthruNode : public ExecNode {
  public:
-  ExampleNode(ExecNode* input, const ExampleNodeOptions&)
+  PassthruNode(ExecNode* input, const ExampleNodeOptions&)
       : ExecNode(/*plan=*/input->plan(), /*inputs=*/{input},
-                 /*input_labels=*/{"ignored"},
+                 /*input_labels=*/{"passed_through"},
                  /*output_schema=*/input->output_schema(), /*num_outputs=*/1) {}
 
-  const char* kind_name() const override { return "ExampleNode"; }
+  const char* kind_name() const override { return "PassthruNode"; }
 
-  arrow::Status StartProducing() override {
-    outputs_[0]->InputFinished(this, 0);
-    return arrow::Status::OK();
+  Status StartProducing() override { return Status::OK(); }
+  void StopProducing() override {}
+
+  void ResumeProducing(ExecNode* output) override { inputs_[0]->PauseProducing(this); }
+  void PauseProducing(ExecNode* output) override { inputs_[0]->PauseProducing(this); }
+  void StopProducing(ExecNode* output) override { inputs_[0]->StopProducing(this); }
+  
+  void InputReceived(ExecNode* input, ExecBatch batch) override {
+    outputs_[0]->InputReceived(this, batch);
+  }
+  void ErrorReceived(ExecNode* input, Status error) override {
+    outputs_[0]->ErrorReceived(this, error);
+  }
+  void InputFinished(ExecNode* input, int total_batches) override {
+    outputs_[0]->InputFinished(this, total_batches);
   }
 
-  void ResumeProducing(ExecNode* output) override {}
-  void PauseProducing(ExecNode* output) override {}
-
-  void StopProducing(ExecNode* output) override { inputs_[0]->StopProducing(this); }
-  void StopProducing() override { inputs_[0]->StopProducing(); }
-
-  void InputReceived(ExecNode* input, cp::ExecBatch batch) override {}
-  void ErrorReceived(ExecNode* input, arrow::Status error) override {}
-  void InputFinished(ExecNode* input, int total_batches) override {}
-
-  arrow::Future<> finished() override { return inputs_[0]->finished(); }
+  Future<> finished() override { return inputs_[0]->finished(); }
 };
 ```
+
+???
+
+This isn't really relevant to people working on bindings since you'd
+never have to implement an ExecNode (just construct a graph of them).
+
+However I thought I'd walk everybody
+through a basic implementation anyway just to show that it's a pretty
+straightforward class.
+
+---
+
+```
+// a basic ExecNode which passes all input batches through unchanged
+class PassthruNode : public ExecNode {
+ public:
+  PassthruNode(ExecNode* input, const ExampleNodeOptions&)
+      : ExecNode(/*plan=*/input->plan(), /*inputs=*/{input},
+                 /*input_labels=*/{"passed_through"},
+                 /*output_schema=*/input->output_schema(), /*num_outputs=*/1) {}
+
+  const char* kind_name() const override { return "PassthruNode"; }
+
+  Status StartProducing() override { return Status::OK(); }
+  void StopProducing() override {}
+
+  void ResumeProducing(ExecNode* output) override { inputs_[0]->PauseProducing(this); }
+  void PauseProducing(ExecNode* output) override { inputs_[0]->PauseProducing(this); }
+  void StopProducing(ExecNode* output) override { inputs_[0]->StopProducing(this); }
+
+* void InputReceived(ExecNode* input, ExecBatch batch) override {
+*   outputs_[0]->InputReceived(this, batch);
+* }
+  void ErrorReceived(ExecNode* input, Status error) override {
+    outputs_[0]->ErrorReceived(this, error);
+  }
+  void InputFinished(ExecNode* input, int total_batches) override {
+    outputs_[0]->InputFinished(this, total_batches);
+  }
+
+  Future<> finished() override { return inputs_[0]->finished(); }
+};
+```
+
+???
+
+Note that this is a push model interface:
+1. an input pushes to this node via the `InputReceived` method
+2. does work on the batch and pushes to its output
+   - for this example we don't do any work
+   - for a FilterNode this is where rows would be dropped
+4. alternatively, we might push an error instead using ErrorReceived
+
+---
+
+```
+// a basic ExecNode which passes all input batches through unchanged
+class PassthruNode : public ExecNode {
+ public:
+  PassthruNode(ExecNode* input, const ExampleNodeOptions&)
+      : ExecNode(/*plan=*/input->plan(), /*inputs=*/{input},
+                 /*input_labels=*/{"passed_through"},
+                 /*output_schema=*/input->output_schema(), /*num_outputs=*/1) {}
+
+  const char* kind_name() const override { return "PassthruNode"; }
+
+  Status StartProducing() override { return Status::OK(); }
+  void StopProducing() override {}
+
+  void ResumeProducing(ExecNode* output) override { inputs_[0]->PauseProducing(this); }
+  void PauseProducing(ExecNode* output) override { inputs_[0]->PauseProducing(this); }
+  void StopProducing(ExecNode* output) override { inputs_[0]->StopProducing(this); }
+
+  void InputReceived(ExecNode* input, ExecBatch batch) override {
+    outputs_[0]->InputReceived(this, batch);
+  }
+  void ErrorReceived(ExecNode* input, Status error) override {
+    outputs_[0]->ErrorReceived(this, error);
+  }
+* void InputFinished(ExecNode* input, int total_batches) override {
+*   outputs_[0]->InputFinished(this, total_batches);
+* }
+
+  Future<> finished() override { return inputs_[0]->finished(); }
+};
+```
+
+???
+
+Slightly confusing name here, but this method is used to signal how many
+batches will ultimately arrive. *It is not sequenced at all.*
+- For this example node, since the number of batches passed through will be
+  identical to the number of batches received, we can simply forward that total
+  count
+- For an aggregate node, we need to wait until we've received all batches of
+  input since the number of groups (and therefore the number of batches of output)
+  is dependent on each row from the input
+  - Unless we're doing scalar aggregation, in which case we'll always output a single row
+
+---
+
+```
+// a basic ExecNode which passes all input batches through unchanged
+class PassthruNode : public ExecNode {
+ public:
+  PassthruNode(ExecNode* input, const ExampleNodeOptions&)
+      : ExecNode(/*plan=*/input->plan(), /*inputs=*/{input},
+                 /*input_labels=*/{"passed_through"},
+                 /*output_schema=*/input->output_schema(), /*num_outputs=*/1) {}
+
+  const char* kind_name() const override { return "PassthruNode"; }
+
+  Status StartProducing() override { return Status::OK(); }
+  void StopProducing() override {}
+
+* void ResumeProducing(ExecNode* output) override { inputs_[0]->PauseProducing(this); }
+* void PauseProducing(ExecNode* output) override { inputs_[0]->PauseProducing(this); }
+* void StopProducing(ExecNode* output) override { inputs_[0]->StopProducing(this); }
+
+  void InputReceived(ExecNode* input, ExecBatch batch) override {
+    outputs_[0]->InputReceived(this, batch);
+  }
+  void ErrorReceived(ExecNode* input, Status error) override {
+    outputs_[0]->ErrorReceived(this, error);
+  }
+  void InputFinished(ExecNode* input, int total_batches) override {
+    outputs_[0]->InputFinished(this, total_batches);
+  }
+
+  Future<> finished() override { return inputs_[0]->finished(); }
+};
+```
+
+???
+
+nodes which receive batches from passthru may request that the passthru pause,
+resume, or stop (which for this example just forwards those to its only input)
+
+Note that most of the methods we've looked at so far are scoped to an edge
+of the graph- they are called exclusively by other nodes which are either
+one step upstream or downstream from `this` node.
+  - This includes error reporting != stopping; errors pass through the graph
+    alongside batches instead of stopping the whole graph
+
+ExecNodes need an explicit start from outside the graph, and *may* be
+The StartProducing and StopProducing methods are invoked by the ExecPlan
+when the entire graph gets going or shuts down
+
+
+---
+
+# The `class`es - `ExecNode`
+
+ExecNode's extra properties:
+
+```
+class ExecNode {
+  // ...
+
+  const std::vector<ExecNode*>& inputs() const;
+  const std::vector<std::string>& input_labels() const;
+
+  const std::vector<ExecNode*>& outputs() const;
+
+  const std::shared_ptr<Schema>& output_schema() const;
+
+  ExecPlan* plan();
+
+  const std::string& label() const;
+  void SetLabel(std::string label);
+
+  std::string ToString() const;
+```
+
+???
+
+Note that you could use `inputs` and `outputs` to walk the graph
+if you needed to do some reflection-y thing on it.
+
+Note that each `ExecNode` has a single output schema
 
 ---
 
@@ -334,10 +555,8 @@ or risk spurious OutOfMemory errors.
 
 # The `class`es - `ExecFactoryRegistry`
 
-None of the concrete implementations of `ExecNode` are exposed
-in headers, so they can't be constructed directly outside the
-Translation Unit where they are defined.
-Instead, factories to create them are added to a registry.
+- `ExecNode` subclasses are not constructed directly
+- factories for each subclass are provided in the registry
 
 ```
 // get the factory for "filter" nodes:
@@ -357,9 +576,16 @@ ExecNode* filter_node = *make_filter(
 
 ???
 
+None of the concrete implementations of `ExecNode` are exposed
+in headers, so they can't be constructed directly outside the
+Translation Unit where they are defined.
+Instead, factories to create them are added to a registry.
+
 "why a registry?"
 
 - Decouple implementations from consumers of the interface
+  (prime example: we have two classes for scalar and grouped aggregate and
+   potentially multiple coming up for hash join)
 - Optimization
 - Easier composition with out-of-library extensions like "scan" nodes
 - More consitent construction for the bindings
@@ -368,10 +594,11 @@ ExecNode* filter_node = *make_filter(
 
 # The `class`es - `ExecFactoryRegistry`
 
-None of the concrete implementations of `ExecNode` are exposed
-in headers, so they can't be constructed directly outside the
-Translation Unit where they are defined.
-Instead, factories to create them are added to a registry.
+`src/arrow/compute/exec/exec_plan.h`
+
+
+- `ExecNode` subclasses are not constructed directly
+- factories for each subclass are provided in the registry
 
 #### .note[Don't use factories directly; we have helper functions:]
 
@@ -387,6 +614,12 @@ ExecNode* filter_node = *MakeExecNode("filter",
   // parameters unique to "filter" nodes
   FilterNodeOptions{filter_expression});
 ```
+
+---
+
+# How to build an ExecPlan
+
+.note[The following will be superceded by Compute IR.]
 
 ---
 
@@ -416,11 +649,12 @@ ExecNode* filter_node = *MakeExecNode("filter",
 // add a project node which materializes new columns based on filter_node's output
 ExecNode* project_node = *MakeExecNode("project", /*...*/);
 
-// add a sink node which collects the batches produced by the pipeline
-ExecNode* sink_node = *MakeExecNode("sink", /*...*/);
+// add a write node which collects the batches produced by the pipeline
+MakeExecNode("write", /*...*/);
 ```
 
-.footnote[FromReader is in [PR#11032](https://github.com/apache/arrow/pull/11032) at the moment, I've included it here for brevity]
+.footnote[FromReader is in [PR#11032](https://github.com/apache/arrow/pull/11032)
+at the moment, I've included it here for brevity]
 
 ???
 
@@ -451,21 +685,28 @@ ExecNode* project_node = *MakeExecNode("project",
                                          {"score + 1"}
                                        });
 
-// add a sink node which collects the batches produced by the pipeline
-std::shared_ptr<RecordBatchReader> sink_reader;
-ExecNode* sink_node = *MakeExecNode("sink",
-                                    plan.get(),
-                                    {project_node},
-                                    SinkNodeOptions::IntoReader(&sink_reader));
+// add a write node which collects the batches produced by the pipeline
+MakeExecNode("write",
+             plan.get(),
+             {project_node},
+             WriteNodeOptions{.base_dir = "/dat", /*...*/});
 ```
 
-.footnote[IntoReader is not in any PR yet]
+.footnote[[WriteNode is in PR#11017](https://github.com/apache/arrow/pull/11017)
+at the moment, I've included it here for brevity]
 
 ???
 
-Note: a sink node produces a stream of batches, so it can
-be consumed by anything which can utilize a stream of batches.
-Anything which can consume a stream can plug into an ExecPlan.
+Note: a sink node is any node which has no outputs;
+batches which arrive at such a node leave the graph in some way.
+In this example the batches pushed to our sink node are
+dumped to disk. However we could just as easily keep those
+in memory as a Table or a RecordBatchReader to be used by some
+non-ExecNode consumer.
+
+Thus:
+an ExecPlan can be consumed by anything which can utilize a stream of batches,
+and anything which can consume a stream of batches can plug into an ExecPlan.
 
 ---
 
@@ -488,7 +729,7 @@ ASSERT_OK(Declaration::Sequence(
                   {"project", ProjectNodeOptions{
                        {add(field_ref("score"), literal(1))},
                        {"score + 1"}}},
-                  {"sink", SinkNodeOptions::IntoReader(&sink_reader)},
+                  {"write", WriteNodeOptions{.base_dir = "/dat", /*...*/}},
               })
               .AddToPlan(plan.get()));
 ```
@@ -539,10 +780,7 @@ https://github.com/apache/arrow/pull/11150
 
 - What about datasets?
 
-Datasets can be used to produce scan nodes, which act like a source.
-(It might be useful to think of a scan node as shorthand for constructing
-a `Scanner` which scans your dataset, getting a `Reader` from the dataset,
-then wrapping that `Reader` into a source node).
+Datasets can be used to produce scan nodes.
 
 ```
 arrow::dataset::internal::Initialize();
@@ -560,13 +798,20 @@ ASSERT_OK(Declaration::Sequence(
               .AddToPlan(plan.get()));
 ```
 
-Datasets may be scanned multiple times, which in this context means one can
-produce multiple scan nodes from a single dataset. (Useful
-for a self-join, for example.)
+Datasets may be scanned multiple times; just make multiple scan
+nodes from that dataset. (Useful for a self-join, for example.)
 
 ???
+Scan nodes are, which act like source nodes which read from the dataset instead
+of from a reader.
+(It might be useful to think of a scan node as shorthand for constructing
+a `Scanner` which scans your dataset, getting a `Reader` from the dataset,
+then wrapping that `Reader` into a source node)
 
 By contrast: RecordBatchReader is not reusable!
+
+Note that producing two scan nodes will perform all reads and decodes twice-
+we don't support splitting a stream of batches yet.
 
 ---
 
@@ -584,15 +829,41 @@ to ExecNode.]
 - minimal functionality
 - targeted for processing single batches
 
-In short, `arrow::compute::Kernel`s are mostly *.note[used by]*
-ExecNode implementations. For example, `FilterNode` uses potentially
-many kernels to evaluate filter conditions and others to materialize
-batches with some rows excluded by that filter condition.
+`arrow::compute::Kernel`s are *.note[used by]* ExecNode implementations
 
 ???
 
   (favorite example: one of the addition kernels adds two buffers of
    `int32_t` into a consumer-preallocated buffer of `int32_t`)
+
+In short, `arrow::compute::Kernel`s are mostly *.note[used by]*
+ExecNode implementations. For example, `FilterNode` uses potentially
+many kernels to evaluate filter conditions and others to materialize
+batches with some rows excluded by that filter condition.
+
+---
+
+# FAQs
+
+- How does this relate to an `arrow::compute::Function`?
+- How does this relate to an `arrow::compute::Expression`?
+
+`arrow::compute::Function`s are a named collection of related kernels.
+
+`arrow::compute::Expression`s are a bundle of function name, arguments, ...
+
+The process of selecting the correct/optimal kernel is called "dispatch".
+
+???
+
+  (favorite example: the "add" function
+   contains one kernel for each input data type)
+
+... everything needed to dispatch and execute.
+
+ExecNodes are usually configured using expressions.
+As ExecNodes are initialized, they perform dispatch (once, before
+running the graph) to select the correct kernels.
 
 ---
 
@@ -630,11 +901,10 @@ There's active debate over whether we want to.
 
 Inside an ExecPlan, they are not ordered.
 
-Dataset scans can cheat this slightly by tagging batches
-with file-of-origin info.
+Dataset scans can cheat this slightly.
 
 `OrderBySinkNode` is the ExecNode which corresponds to
-SQL's `ORDER BY`. It sorts the batches *as they leave the graph*.
+SQL's `ORDER BY`.
 
 We may need to change this; some aggregates and window functions
 require ordering of their input.
@@ -644,6 +914,8 @@ require ordering of their input.
 
 Tagging breaks down some when we split batches for fan out
 
+OrderBySinkNode sorts the batches *as they leave the graph*.
+
 Our interface for reusability is the stream of batches,
 which is unordered.
 
@@ -651,13 +923,16 @@ which is unordered.
 
 # Eventually...
 
-  - Taskify
-  - Backpressure
-  - Graceful spill-to-disk/out-of-core execution
-  - fan out execution of expressions ala HyPer
+  - Taskify (ARROW-13576)
+  - Backpressure/spill-to-disk/out-of-core
+  - Fan out execution of expressions ala HyPer
   - Maybe allow ordering along some edges of the graph
   - Maybe multiple outputs
-  - No more explicit construction. *Everybody* should produce IR
-    and have that mapped onto ExecNodes.
+  - Compute IR -> ExecPlan (ARROW-14074)
   - GPU backed ExecNodes
+  - Writing to a dataset (ARROW-13542)
 
+???
+
+No more explicit construction. *Everybody* should produce IR
+    and have that mapped onto ExecNodes.
